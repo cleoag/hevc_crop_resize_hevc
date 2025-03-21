@@ -6,6 +6,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mathematics.h>
 #include <libswscale/swscale.h>
 #include <x265.h>            // x265 encoder
 
@@ -14,8 +15,12 @@
 #define INPUT_HEIGHT 2880    // Input height
 #define OUTPUT_WIDTH 200     // Output width
 #define OUTPUT_HEIGHT 200    // Output height (square)
-#define FRAME_RATE 50        // Output frame rate 
+#define FRAME_RATE 50        // Output frame rate
+#define OUTPUT_TIMEBASE 48000 // Output timebase denominator
 #define MAX_NAL_SIZE (4*1024*1024)  // 4MB buffer for NAL units
+
+// Enable fMP4 muxing
+#define ENABLE_MP4_MUXING 1  // Set to 1 to output fMP4, 0 for raw HEVC
 
 typedef struct {
     // Libav decoder
@@ -35,11 +40,20 @@ typedef struct {
     x265_param *encoder_params;
     x265_picture *enc_pic;
     
-    // File I/O
+    // File I/O for raw HEVC
     FILE *output_file;
+    
+    // Muxing output to MP4
+    AVFormatContext *ofmt_ctx;
+    AVStream *out_stream;
+    int64_t pts_offset;
+    int64_t next_pts;
+    uint8_t *extradata;
+    int extradata_size;
     
     // Processing options
     int skip_frames;        // 1 to skip every other frame, 0 to process all frames
+    int mp4_output;         // 1 to output MP4, 0 for raw HEVC
 } ProcessingContext;
 
 // Initialize x265 encoder with better quality settings
@@ -57,8 +71,14 @@ int init_encoder(ProcessingContext *ctx) {
     // Configure encoder for better quality while maintaining reasonable speed
     ctx->encoder_params->sourceWidth = OUTPUT_WIDTH;
     ctx->encoder_params->sourceHeight = OUTPUT_HEIGHT;
-    ctx->encoder_params->fpsNum = FRAME_RATE;
+    
+    // Set frame rate - this is how x265 defines timebase internally
+    int output_fps = ctx->skip_frames ? FRAME_RATE / 2 : FRAME_RATE;
+    ctx->encoder_params->fpsNum = output_fps;
     ctx->encoder_params->fpsDenom = 1;
+    
+    // Note: x265 doesn't have a direct timebase parameter, it derives it from fps
+    
     ctx->encoder_params->internalCsp = X265_CSP_I420;
     
     // Quality settings
@@ -102,7 +122,7 @@ int init_encoder(ProcessingContext *ctx) {
 }
 
 // Prepare frame for x265 encoding
-void prepare_for_encoding(ProcessingContext *ctx, int pts) {
+void prepare_for_encoding(ProcessingContext *ctx, int64_t pts) {
     // Set plane pointers
     ctx->enc_pic->planes[0] = ctx->scaled_buffer;  // Y plane
     ctx->enc_pic->planes[1] = ctx->scaled_buffer + (OUTPUT_WIDTH * OUTPUT_HEIGHT);  // U plane
@@ -117,6 +137,179 @@ void prepare_for_encoding(ProcessingContext *ctx, int pts) {
     ctx->enc_pic->pts = pts;
     ctx->enc_pic->bitDepth = 8;
     ctx->enc_pic->colorSpace = X265_CSP_I420;
+}
+
+// Initialize MP4 muxer
+int init_mp4_muxer(ProcessingContext *ctx, const char *output_file) {
+    int ret;
+    avformat_alloc_output_context2(&ctx->ofmt_ctx, NULL, "mp4", output_file);
+    if (!ctx->ofmt_ctx) {
+        fprintf(stderr, "Could not create output context\n");
+        return -1;
+    }
+    
+    // Add video stream
+    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_HEVC);
+    ctx->out_stream = avformat_new_stream(ctx->ofmt_ctx, codec);
+    if (!ctx->out_stream) {
+        fprintf(stderr, "Failed to allocate output stream\n");
+        return -1;
+    }
+    
+    ctx->out_stream->id = ctx->ofmt_ctx->nb_streams - 1;
+    
+    // Configure stream parameters
+    AVCodecParameters *codecpar = ctx->out_stream->codecpar;
+    codecpar->codec_id = AV_CODEC_ID_HEVC;
+    codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    codecpar->width = OUTPUT_WIDTH;
+    codecpar->height = OUTPUT_HEIGHT;
+    codecpar->format = AV_PIX_FMT_YUV420P;
+    codecpar->bit_rate = ctx->encoder_params->rc.bitrate * 1000;
+    
+    // Set stream timebase - for MP4, must match the timebase we use for timestamps
+    ctx->out_stream->time_base = (AVRational){1, OUTPUT_TIMEBASE};
+    
+    // Set fragmented MP4 options
+    if (ctx->ofmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
+        ctx->ofmt_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    
+    // Set MP4 fragmentation options for lower latency streaming
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+    
+    // Open output file
+    if (!(ctx->ofmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&ctx->ofmt_ctx->pb, output_file, AVIO_FLAG_WRITE);
+        if (ret < 0) {
+            fprintf(stderr, "Could not open output file '%s'\n", output_file);
+            return -1;
+        }
+    }
+    
+    // Save initial x265 header info for extradata
+    ctx->extradata = NULL;
+    ctx->extradata_size = 0;
+    ctx->pts_offset = 0;
+    ctx->next_pts = 0;
+    
+    // Initialize with invalid PTS to detect the first real frame
+    ctx->pts_offset = AV_NOPTS_VALUE;
+    
+    return 0;
+}
+
+// Write x265 NAL units to MP4 container
+int write_nals_to_mp4(ProcessingContext *ctx, x265_nal *nals, uint32_t nal_count, int64_t pts, int is_key_frame) {
+    if (!nals || nal_count == 0) {
+        return 0;
+    }
+    
+    // Create AVPacket using modern API
+    AVPacket pkt = {0};
+    av_packet_unref(&pkt);
+    
+    // Calculate total size needed
+    int total_size = 0;
+    for (uint32_t i = 0; i < nal_count; i++) {
+        total_size += nals[i].sizeBytes;
+    }
+    
+    // Allocate buffer for packet data
+    uint8_t *packet_data = av_malloc(total_size);
+    if (!packet_data) {
+        fprintf(stderr, "Failed to allocate packet data buffer\n");
+        return -1;
+    }
+    
+    // Copy NAL units into packet buffer
+    int offset = 0;
+    for (uint32_t i = 0; i < nal_count; i++) {
+        memcpy(packet_data + offset, nals[i].payload, nals[i].sizeBytes);
+        offset += nals[i].sizeBytes;
+    }
+    
+    // Set up packet
+    pkt.data = packet_data;
+    pkt.size = total_size;
+    pkt.pts = pkt.dts = pts;
+    pkt.duration = 0;  // Will be filled in by the muxer
+    pkt.stream_index = ctx->out_stream->index;
+    pkt.flags = is_key_frame ? AV_PKT_FLAG_KEY : 0;
+    
+    // Store the latest PTS for duration calculations
+    ctx->next_pts = pts;
+    
+    // Write packet to MP4 container
+    int ret = av_interleaved_write_frame(ctx->ofmt_ctx, &pkt);
+    if (ret < 0) {
+        fprintf(stderr, "Error writing packet to output: %d\n", ret);
+        av_free(packet_data);
+        av_packet_unref(&pkt);
+        return -1;
+    }
+    
+    // Free packet data
+    av_free(packet_data);
+    av_packet_unref(&pkt);
+    
+    return 0;
+}
+
+// Write HEVC headers (VPS, SPS, PPS) as extradata to MP4
+int write_hevc_headers_to_mp4(ProcessingContext *ctx, x265_nal *nals, uint32_t nal_count) {
+    if (!nals || nal_count == 0) {
+        return 0;
+    }
+    
+    // Calculate total size needed
+    int total_size = 0;
+    for (uint32_t i = 0; i < nal_count; i++) {
+        total_size += nals[i].sizeBytes + 4; // 4 bytes for length prefix
+    }
+    
+    // Allocate buffer for extradata
+    ctx->extradata = av_mallocz(total_size);
+    if (!ctx->extradata) {
+        fprintf(stderr, "Failed to allocate extradata buffer\n");
+        return -1;
+    }
+    
+    // Format headers as AVCC format (length-prefixed NALs)
+    int offset = 0;
+    for (uint32_t i = 0; i < nal_count; i++) {
+        uint32_t size = nals[i].sizeBytes;
+        ctx->extradata[offset++] = (size >> 24) & 0xFF;
+        ctx->extradata[offset++] = (size >> 16) & 0xFF;
+        ctx->extradata[offset++] = (size >> 8) & 0xFF;
+        ctx->extradata[offset++] = size & 0xFF;
+        memcpy(ctx->extradata + offset, nals[i].payload, nals[i].sizeBytes);
+        offset += nals[i].sizeBytes;
+    }
+    
+    ctx->extradata_size = offset;
+    
+    // Set the extradata in the stream codec parameters
+    ctx->out_stream->codecpar->extradata = av_mallocz(ctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!ctx->out_stream->codecpar->extradata) {
+        fprintf(stderr, "Failed to allocate stream extradata\n");
+        av_free(ctx->extradata);
+        ctx->extradata = NULL;
+        return -1;
+    }
+    
+    memcpy(ctx->out_stream->codecpar->extradata, ctx->extradata, ctx->extradata_size);
+    ctx->out_stream->codecpar->extradata_size = ctx->extradata_size;
+    
+    // Write MP4 header
+    int ret = avformat_write_header(ctx->ofmt_ctx, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Error writing MP4 header: %d\n", ret);
+        return -1;
+    }
+    
+    return 0;
 }
 
 // Clean up and free resources
@@ -157,6 +350,25 @@ void cleanup(ProcessingContext *ctx) {
     // Close files
     if (ctx->output_file) {
         fclose(ctx->output_file);
+    }
+    
+    // Close MP4 muxer
+    if (ctx->ofmt_ctx) {
+        if (ctx->mp4_output && ctx->ofmt_ctx->pb) {
+            // Write trailer before closing
+            av_write_trailer(ctx->ofmt_ctx);
+        }
+        
+        if (!(ctx->ofmt_ctx->oformat->flags & AVFMT_NOFILE) && ctx->ofmt_ctx->pb) {
+            avio_closep(&ctx->ofmt_ctx->pb);
+        }
+        
+        avformat_free_context(ctx->ofmt_ctx);
+    }
+    
+    // Free extradata
+    if (ctx->extradata) {
+        av_free(ctx->extradata);
     }
 }
 
@@ -235,12 +447,15 @@ int init_decoder(ProcessingContext *ctx, const char *input_file) {
         return -1;
     }
     
-    // Find decoder
-    ctx->decoder_codec = avcodec_find_decoder(ctx->fmt_ctx->streams[ctx->video_stream_idx]->codecpar->codec_id);
-    if (!ctx->decoder_codec) {
+    // Find decoder - using const AVCodec* as required by newer FFmpeg
+    const AVCodec *decoder_codec = avcodec_find_decoder(ctx->fmt_ctx->streams[ctx->video_stream_idx]->codecpar->codec_id);
+    if (!decoder_codec) {
         fprintf(stderr, "Failed to find decoder\n");
         return -1;
     }
+    
+    // Store in context - need to cast away const for compatibility with older FFmpeg
+    ctx->decoder_codec = (AVCodec *)decoder_codec;
     
     // Create decoder context
     ctx->decoder_ctx = avcodec_alloc_context3(ctx->decoder_codec);
@@ -311,7 +526,8 @@ int main(int argc, char *argv[]) {
     
     // Parse command line arguments
     if (argc < 3 || argc > 4) {
-        fprintf(stderr, "Usage: %s <input_hevc> <output_hevc> [skip]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input_hevc> <output_file> [skip]\n", argv[0]);
+        fprintf(stderr, "       <output_file> can be .hevc for raw HEVC or .mp4 for MP4 container\n");
         fprintf(stderr, "       Add 'skip' to skip every other input frame\n");
         return 1;
     }
@@ -324,16 +540,20 @@ int main(int argc, char *argv[]) {
         printf("Frame skipping enabled: processing every other input frame\n");
     }
     
+    // Detect output format based on file extension
+    int mp4_output = 0;
+    const char *ext = strrchr(output_file, '.');
+    if (ext && strcmp(ext, ".mp4") == 0) {
+        mp4_output = 1;
+        printf("Using MP4 container for output\n");
+    } else {
+        printf("Using raw HEVC for output\n");
+    }
+    
     ProcessingContext ctx = {0};
     ctx.skip_frames = skip_frames;
+    ctx.mp4_output = mp4_output;
     int ret;
-    
-    // Open output file
-    ctx.output_file = fopen(output_file, "wb");
-    if (!ctx.output_file) {
-        fprintf(stderr, "Error: Could not open output file: %s\n", output_file);
-        return 1;
-    }
     
     // Initialize components
     if (init_decoder(&ctx, input_file) < 0 || init_encoder(&ctx) < 0) {
@@ -342,11 +562,51 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    // Initialize output based on format
+    if (mp4_output) {
+        if (init_mp4_muxer(&ctx, output_file) < 0) {
+            fprintf(stderr, "Error: MP4 muxer initialization failed\n");
+            cleanup(&ctx);
+            return 1;
+        }
+    } else {
+        // Open raw HEVC output file
+        ctx.output_file = fopen(output_file, "wb");
+        if (!ctx.output_file) {
+            fprintf(stderr, "Error: Could not open output file: %s\n", output_file);
+            cleanup(&ctx);
+            return 1;
+        }
+    }
+    
     // Process frames
     int frame_count = 0;      // Count of processed frames
     int input_frame_count = 0; // Count of input frames seen
     x265_nal *nals = NULL;
     uint32_t nal_count = 0;
+    
+    // For timestamp conversion
+    AVRational input_time_base;
+    AVRational output_time_base = {1, OUTPUT_TIMEBASE}; // Output time base is 1/48000
+    
+    if (ctx.fmt_ctx && ctx.video_stream_idx >= 0) {
+        input_time_base = ctx.fmt_ctx->streams[ctx.video_stream_idx]->time_base;
+        printf("Input video time base: %d/%d\n", input_time_base.num, input_time_base.den);
+    } else {
+        input_time_base.num = 1;
+        input_time_base.den = FRAME_RATE;
+    }
+    
+    printf("Output video time base: %d/%d\n", output_time_base.num, output_time_base.den);
+    
+    // Calculate the timestamp increment for each frame
+    // For 50 fps: 48000 / 50 = 960 units per frame
+    // For 25 fps (skip mode): 48000 / 25 = 1920 units per frame
+    int timestamp_increment = ctx.skip_frames ? 
+                             (OUTPUT_TIMEBASE / (FRAME_RATE / 2)) : 
+                             (OUTPUT_TIMEBASE / FRAME_RATE);
+                             
+    printf("Using timestamp increment of %d units per frame\n", timestamp_increment);
     
     printf("Starting to process frames...\n");
     
@@ -358,20 +618,34 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // Write headers to output file
-    for (uint32_t i = 0; i < nal_count; i++) {
-        // Add HEVC start code (0x00 0x00 0x01)
-        uint8_t start_code[4] = {0, 0, 0, 1};
-        fwrite(start_code, 1, 4, ctx.output_file);
-        
-        // Write NAL unit
-        fwrite(nals[i].payload, 1, nals[i].sizeBytes, ctx.output_file);
+    // Write headers based on output format
+    if (mp4_output) {
+        // Store HEVC headers as extradata for MP4
+        if (write_hevc_headers_to_mp4(&ctx, nals, nal_count) < 0) {
+            fprintf(stderr, "Failed to write HEVC headers to MP4\n");
+            cleanup(&ctx);
+            return 1;
+        }
+    } else {
+        // Write headers to raw HEVC output file
+        for (uint32_t i = 0; i < nal_count; i++) {
+            // Add HEVC start code (0x00 0x00 0x01)
+            uint8_t start_code[4] = {0, 0, 0, 1};
+            fwrite(start_code, 1, 4, ctx.output_file);
+            
+            // Write NAL unit
+            fwrite(nals[i].payload, 1, nals[i].sizeBytes, ctx.output_file);
+        }
     }
     
     // Main processing loop using FFmpeg's demuxing API
     while (av_read_frame(ctx.fmt_ctx, ctx.pkt) >= 0) {
         // Check if this packet belongs to the video stream
         if (ctx.pkt->stream_index == ctx.video_stream_idx) {
+            // Save packet timestamp for later use if frame PTS is invalid
+            int64_t pkt_pts = ctx.pkt->pts;
+            int64_t pkt_dts = ctx.pkt->dts;
+            
             // Send packet to decoder
             ret = avcodec_send_packet(ctx.decoder_ctx, ctx.pkt);
             if (ret < 0) {
@@ -400,8 +674,28 @@ int main(int argc, char *argv[]) {
                     // Process frame: crop and scale using SwScale
                     process_frame_with_swscale(&ctx, ctx.frame);
                     
-                    // Prepare for encoding
-                    prepare_for_encoding(&ctx, frame_count);
+                    // Get timestamp from input frame for informational purposes
+                    int64_t input_pts = ctx.frame->pts;
+                    if (input_pts == AV_NOPTS_VALUE) {
+                        // If no valid PTS in the frame, try packet PTS or DTS
+                        if (pkt_pts != AV_NOPTS_VALUE) {
+                            input_pts = pkt_pts;
+                        } else if (pkt_dts != AV_NOPTS_VALUE) {
+                            input_pts = pkt_dts;
+                        } else {
+                            // Last resort: use frame count
+                            input_pts = input_frame_count;
+                        }
+                    }
+                    
+                    // Calculate timestamp for output frame based on frame count and timebase
+                    int64_t output_pts = frame_count * timestamp_increment;
+                    
+                    printf("Frame %d: Input PTS = %lld, Output PTS = %lld\n", 
+                          input_frame_count, (long long)input_pts, (long long)output_pts);
+                    
+                    // Prepare for encoding with correct timestamps for timebase 1/48000
+                    prepare_for_encoding(&ctx, output_pts);
                     
                     // Force keyframe at the start
                     if (frame_count == 0) {
@@ -415,14 +709,34 @@ int main(int argc, char *argv[]) {
                         break;
                     }
                     
-                    // Write NALs to output file
-                    for (uint32_t i = 0; i < nal_count; i++) {
-                        // Add HEVC start code (0x00 0x00 0x01)
-                        uint8_t start_code[4] = {0, 0, 0, 1};
-                        fwrite(start_code, 1, 4, ctx.output_file);
-                        
-                        // Write NAL unit
-                        fwrite(nals[i].payload, 1, nals[i].sizeBytes, ctx.output_file);
+                    // Process encoded NALs based on output format
+                    if (nal_count > 0) {
+                        if (mp4_output) {
+                            // Write to MP4 container
+                            int is_keyframe = 0;
+                            // Check if this is a keyframe by looking for IDR NAL type
+                            for (uint32_t i = 0; i < nal_count; i++) {
+                                // HEVC NAL unit type is in the first byte, bits 1-6 (7 bits total)
+                                uint8_t nal_type = (nals[i].payload[0] >> 1) & 0x3F;
+                                // Types 16-21 are IRAP (keyframe) types
+                                if (nal_type >= 16 && nal_type <= 21) {
+                                    is_keyframe = 1;
+                                    break;
+                                }
+                            }
+                            
+                            write_nals_to_mp4(&ctx, nals, nal_count, output_pts, is_keyframe);
+                        } else {
+                            // Write to raw HEVC file
+                            for (uint32_t i = 0; i < nal_count; i++) {
+                                // Add HEVC start code (0x00 0x00 0x01)
+                                uint8_t start_code[4] = {0, 0, 0, 1};
+                                fwrite(start_code, 1, 4, ctx.output_file);
+                                
+                                // Write NAL unit
+                                fwrite(nals[i].payload, 1, nals[i].sizeBytes, ctx.output_file);
+                            }
+                        }
                     }
                     
                     frame_count++;
@@ -451,13 +765,21 @@ int main(int argc, char *argv[]) {
         ret = x265_encoder_encode(ctx.encoder, &nals, &nal_count, NULL, NULL);
         if (ret <= 0) break;
         
-        for (uint32_t i = 0; i < nal_count; i++) {
-            // Add HEVC start code (0x00 0x00 0x01)
-            uint8_t start_code[4] = {0, 0, 0, 1};
-            fwrite(start_code, 1, 4, ctx.output_file);
-            
-            // Write NAL unit
-            fwrite(nals[i].payload, 1, nals[i].sizeBytes, ctx.output_file);
+        // Process remaining NALs
+        if (mp4_output) {
+            // Write to MP4 container - we assume flush packets are not keyframes
+            write_nals_to_mp4(&ctx, nals, nal_count, ctx.next_pts + timestamp_increment, 0);
+            ctx.next_pts += timestamp_increment;
+        } else {
+            // Write to raw HEVC file
+            for (uint32_t i = 0; i < nal_count; i++) {
+                // Add HEVC start code (0x00 0x00 0x01)
+                uint8_t start_code[4] = {0, 0, 0, 1};
+                fwrite(start_code, 1, 4, ctx.output_file);
+                
+                // Write NAL unit
+                fwrite(nals[i].payload, 1, nals[i].sizeBytes, ctx.output_file);
+            }
         }
     }
     
