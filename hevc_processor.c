@@ -175,10 +175,6 @@ int init_mp4_muxer(ProcessingContext *ctx, const char *output_file) {
         ctx->ofmt_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
     
-    // Set MP4 fragmentation options for lower latency streaming
-    AVDictionary *opts = NULL;
-    av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
-    
     // Open output file
     if (!(ctx->ofmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open(&ctx->ofmt_ctx->pb, output_file, AVIO_FLAG_WRITE);
@@ -302,12 +298,19 @@ int write_hevc_headers_to_mp4(ProcessingContext *ctx, x265_nal *nals, uint32_t n
     memcpy(ctx->out_stream->codecpar->extradata, ctx->extradata, ctx->extradata_size);
     ctx->out_stream->codecpar->extradata_size = ctx->extradata_size;
     
-    // Write MP4 header
-    int ret = avformat_write_header(ctx->ofmt_ctx, NULL);
+    // Create dictionary for MP4 muxer options
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+    
+    // Write MP4 header with options
+    int ret = avformat_write_header(ctx->ofmt_ctx, &opts);
     if (ret < 0) {
         fprintf(stderr, "Error writing MP4 header: %d\n", ret);
         return -1;
     }
+    
+    // Free dictionary
+    av_dict_free(&opts);
     
     return 0;
 }
