@@ -14,7 +14,7 @@
 #define INPUT_HEIGHT 2880    // Input height
 #define OUTPUT_WIDTH 200     // Output width
 #define OUTPUT_HEIGHT 200    // Output height (square)
-#define FRAME_RATE 50      // Assuming 60fps
+#define FRAME_RATE 50        // Output frame rate 
 #define MAX_NAL_SIZE (4*1024*1024)  // 4MB buffer for NAL units
 
 typedef struct {
@@ -37,6 +37,9 @@ typedef struct {
     
     // File I/O
     FILE *output_file;
+    
+    // Processing options
+    int skip_frames;        // 1 to skip every other frame, 0 to process all frames
 } ProcessingContext;
 
 // Initialize x265 encoder with better quality settings
@@ -302,15 +305,27 @@ int init_decoder(ProcessingContext *ctx, const char *input_file) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <input_hevc> <output_hevc>\n", argv[0]);
+    int skip_frames = 0;  // Default: process all frames
+    const char *input_file = NULL;
+    const char *output_file = NULL;
+    
+    // Parse command line arguments
+    if (argc < 3 || argc > 4) {
+        fprintf(stderr, "Usage: %s <input_hevc> <output_hevc> [skip]\n", argv[0]);
+        fprintf(stderr, "       Add 'skip' to skip every other input frame\n");
         return 1;
     }
     
-    const char *input_file = argv[1];
-    const char *output_file = argv[2];
+    input_file = argv[1];
+    output_file = argv[2];
+    
+    if (argc == 4 && strcmp(argv[3], "skip") == 0) {
+        skip_frames = 1;
+        printf("Frame skipping enabled: processing every other input frame\n");
+    }
     
     ProcessingContext ctx = {0};
+    ctx.skip_frames = skip_frames;
     int ret;
     
     // Open output file
@@ -328,7 +343,8 @@ int main(int argc, char *argv[]) {
     }
     
     // Process frames
-    int frame_count = 0;
+    int frame_count = 0;      // Count of processed frames
+    int input_frame_count = 0; // Count of input frames seen
     x265_nal *nals = NULL;
     uint32_t nal_count = 0;
     
@@ -374,40 +390,52 @@ int main(int argc, char *argv[]) {
                     break;
                 }
                 
-                // Process frame: crop and scale using SwScale
-                process_frame_with_swscale(&ctx, ctx.frame);
-                
-                // Prepare for encoding
-                prepare_for_encoding(&ctx, frame_count);
-                
-                // Force keyframe at the start
-                if (frame_count == 0) {
-                    ctx.enc_pic->sliceType = X265_TYPE_IDR;
+                // Decide whether to process this frame or skip it
+                int should_process = 1;
+                if (ctx.skip_frames && (input_frame_count % 2 == 1)) {
+                    should_process = 0;  // Skip this frame
                 }
                 
-                // Encode the frame
-                ret = x265_encoder_encode(ctx.encoder, &nals, &nal_count, ctx.enc_pic, NULL);
-                if (ret < 0) {
-                    fprintf(stderr, "Error encoding frame: %d\n", ret);
-                    break;
-                }
-                
-                // Write NALs to output file
-                for (uint32_t i = 0; i < nal_count; i++) {
-                    // Add HEVC start code (0x00 0x00 0x01)
-                    uint8_t start_code[4] = {0, 0, 0, 1};
-                    fwrite(start_code, 1, 4, ctx.output_file);
+                if (should_process) {
+                    // Process frame: crop and scale using SwScale
+                    process_frame_with_swscale(&ctx, ctx.frame);
                     
-                    // Write NAL unit
-                    fwrite(nals[i].payload, 1, nals[i].sizeBytes, ctx.output_file);
+                    // Prepare for encoding
+                    prepare_for_encoding(&ctx, frame_count);
+                    
+                    // Force keyframe at the start
+                    if (frame_count == 0) {
+                        ctx.enc_pic->sliceType = X265_TYPE_IDR;
+                    }
+                    
+                    // Encode the frame
+                    ret = x265_encoder_encode(ctx.encoder, &nals, &nal_count, ctx.enc_pic, NULL);
+                    if (ret < 0) {
+                        fprintf(stderr, "Error encoding frame: %d\n", ret);
+                        break;
+                    }
+                    
+                    // Write NALs to output file
+                    for (uint32_t i = 0; i < nal_count; i++) {
+                        // Add HEVC start code (0x00 0x00 0x01)
+                        uint8_t start_code[4] = {0, 0, 0, 1};
+                        fwrite(start_code, 1, 4, ctx.output_file);
+                        
+                        // Write NAL unit
+                        fwrite(nals[i].payload, 1, nals[i].sizeBytes, ctx.output_file);
+                    }
+                    
+                    frame_count++;
+                    
+                    // Print progress
+                    if (frame_count % 10 == 0) {
+                        printf("Processed %d frames\n", frame_count);
+                    }
+                } else {
+                    printf("Skipping input frame %d\n", input_frame_count);
                 }
                 
-                frame_count++;
-                
-                // Print progress
-                if (frame_count % 10 == 0) {
-                    printf("Processed %d frames\n", frame_count);
-                }
+                input_frame_count++;
                 
                 // Unref the frame
                 av_frame_unref(ctx.frame);
@@ -433,7 +461,7 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    printf("Done! Processed %d frames\n", frame_count);
+    printf("Done! Processed %d frames out of %d input frames\n", frame_count, input_frame_count);
     
     cleanup(&ctx);
     return 0;

@@ -47,17 +47,32 @@ gcc -o hevc_processor hevc_processor.c -lavcodec -lavformat -lavutil -lswscale -
 ## Usage
 
 ```bash
-./hevc_processor <input_hevc> <output_hevc>
+./hevc_processor <input_hevc> <output_hevc> [skip]
 ```
 
 Where:
 - `<input_hevc>`: Path to the input HEVC file (180° stereo fisheye video, typically 5760×2880)
 - `<output_hevc>`: Path where the output HEVC file will be saved (720×720)
+- `[skip]`: Optional parameter. Add "skip" to process only every other input frame while maintaining the same output frame rate
 
-### Example
+### Examples
 
+Process all frames:
 ```bash
 ./hevc_processor input.hevc output.hevc
+```
+
+Process every other frame (for faster processing with same output fps):
+```bash
+./hevc_processor input.hevc output.hevc skip
+```
+
+### Playing Output Files
+
+To play output files at the correct frame rate (50fps), use FFplay:
+
+```bash
+ffplay -fflags nobuffer -framedrop -vf "fps=50" output.hevc
 ```
 
 ## Processing Details
@@ -69,16 +84,15 @@ Where:
   - Scales down to 720×720 using bilinear interpolation
   - Re-encodes using x265 with optimized parameters
 - Output: 720×720 HEVC video with left eye only
+- Optional frame skipping for faster processing
 
 ## Performance
 
-The tool is optimized for lower resource usage with these encoding settings:
-- Ultrafast preset
-- Zero latency mode
-- No B-frames
-- Single reference frame
-- Single thread processing
-- 1 Mbps target bitrate
+The tool is optimized for high quality with these encoding settings:
+- Medium preset (balanced quality/speed)
+- 3 Mbps target bitrate
+- Multi-threading with 4 threads
+- Frame skipping option for faster processing
 
 ## Troubleshooting
 
